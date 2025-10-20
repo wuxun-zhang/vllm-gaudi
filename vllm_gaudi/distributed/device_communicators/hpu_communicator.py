@@ -68,18 +68,24 @@ class HpuCommunicator(DeviceCommunicatorBase):
 
         dp_metadata = get_forward_context().dp_metadata
         assert dp_metadata is not None
-        hidden_states_across_dp = dp_metadata.hidden_states_across_dp
-        router_logits_across_dp = dp_metadata.router_logits_across_dp
 
-        torch.distributed.all_gather_into_tensor(
-            hidden_states_across_dp,
-            hidden_states,
-            group=get_ep_group().device_group if is_sequence_parallel else self.dp_group.device_group)
+        if hidden_states is not None:
+            hidden_states_across_dp = dp_metadata.hidden_states_across_dp
+            torch.distributed.all_gather_into_tensor(
+                hidden_states_across_dp,
+                hidden_states,
+                group=get_ep_group().device_group if is_sequence_parallel else self.dp_group.device_group)
+        else:
+            hidden_states_across_dp = None
 
-        torch.distributed.all_gather_into_tensor(
-            router_logits_across_dp,
-            router_logits,
-            group=get_ep_group().device_group if is_sequence_parallel else self.dp_group.device_group)
+        if router_logits is not None:
+            router_logits_across_dp = dp_metadata.router_logits_across_dp
+            torch.distributed.all_gather_into_tensor(
+                router_logits_across_dp,
+                router_logits,
+                group=get_ep_group().device_group if is_sequence_parallel else self.dp_group.device_group)
+        else:
+            router_logits_across_dp = None
         return hidden_states_across_dp, router_logits_across_dp
 
     def combine(self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False) -> torch.Tensor:

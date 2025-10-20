@@ -4,6 +4,7 @@ from typing import Callable, Optional
 import torch
 from torch.nn.parameter import Parameter
 from vllm_gaudi import envs
+from vllm.distributed import get_dp_group, get_ep_group
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.layer import (FusedMoE, FusedMoeWeightScaleSupported)
 
@@ -182,7 +183,13 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         else:
             if self.quant_config.is_checkpoint_fp8_serialized and\
                 self.quant_config.activation_scheme == "static":
-                layer.w13_input_scale = torch.nn.Parameter(layer.w13_input_scale.max(), requires_grad=False)
+                local_w13_input_scale = layer.w13_input_scale.max()
+                if layer.dp_size > 1:
+                    torch.distributed.all_reduce(local_w13_input_scale,\
+                        op=torch.distributed.ReduceOp.MAX,\
+                            group=get_ep_group().device_group if layer.is_sequence_parallel else\
+                                get_dp_group().device_group)
+                layer.w13_input_scale = torch.nn.Parameter(local_w13_input_scale, requires_grad=False)
                 layer.w2_input_scale = torch.nn.Parameter(layer.w2_input_scale.max(), requires_grad=False)
                 num_experts = layer.w13_weight.shape[0]
                 self.w13_weight_list = [layer.w13_weight.data[i, ...] for i in range(num_experts)]
@@ -214,6 +221,11 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         activation: str = "silu",
         **kwargs,
     ) -> torch.Tensor:
+        if self.quant_config.activation_scheme == "static" and layer.dp_size > 1:
+            x_scale = layer.w13_input_scale.data
+            x = torch.ops.hpu.cast_to_fp8_v2(x, 1.0 / x_scale, False, False, torch.float8_e4m3fn)[0]
+            x, _ = get_ep_group().dispatch(x, None, layer.is_sequence_parallel)
+
         input_shape = x.shape
         x = x.view(-1, x.shape[-1])
         if use_grouped_topk or custom_routing_function is not None:
@@ -238,7 +250,10 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         topk_weights = topk_weights.view(*x.shape[:-1], -1)
         if self.quant_config.activation_scheme == "static":
             x_scale = layer.w13_input_scale.data
-            x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0 / x_scale, False, False, torch.float8_e4m3fn)[0]
+            if layer.dp_size == 1:
+                x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0 / x_scale, False, False, torch.float8_e4m3fn)[0]
+            else:
+                x_fp8 = x
 
             batched_tokens = x.shape[0]
             kwargs = {}
