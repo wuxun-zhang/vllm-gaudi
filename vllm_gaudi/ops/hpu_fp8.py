@@ -239,7 +239,6 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         if self.quant_config.activation_scheme == "static":
             x_scale = layer.w13_input_scale.data
             x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0 / x_scale, False, False, torch.float8_e4m3fn)[0]
-            topk_weights = topk_weights.to(torch.bfloat16)
 
             batched_tokens = x.shape[0]
             kwargs = {}
