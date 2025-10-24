@@ -1445,9 +1445,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             num_computed_tokens = self.input_batch.num_computed_tokens_cpu[i]
             num_prompt_tokens = self.input_batch.num_prompt_tokens[i]
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            logger.debug(
-                f"Traverse decodes: req_id {req_id}, num_computed_tokens {num_computed_tokens}, num_prompt_tokens {num_prompt_tokens}, num_scheduled_tokens {num_scheduled_tokens}, is_decoder_only {self.is_decoder_only(req_id)}"
-            )
 
             if num_computed_tokens < num_prompt_tokens and \
                 not self.is_decoder_only(req_id):
@@ -1460,9 +1457,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
             decode_req_ids.append(req_id)
             num_computed_tokens_decode.append(int(num_computed_tokens + 1))
-            logger.debug(
-                f"Traverse decodes: add req_id {req_id} to decode_req_ids, append {int(num_computed_tokens + 1)} to num_computed_tokens_decode"
-            )
 
         if self.profiler.enabled:
             self.profiler_counter_helper.capture_decode_seq_stats(num_computed_tokens_decode)
@@ -1481,9 +1475,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             # Must be prompt
             assert num_computed_tokens < num_prompt_tokens
             num_output_tokens = len(self.requests[req_id].output_token_ids)
-            logger.debug(
-                f"Traverse prompts: req_id {req_id}, num_computed_tokens {num_computed_tokens}, num_prompt_tokens {num_prompt_tokens}, num_scheduled_tokens {num_scheduled_tokens}, num_output_tokens {num_output_tokens}"
-            )
             if not has_kv_transfer_group():
                 #P case num_output_tokens has non 0
                 assert num_output_tokens == 0, \
@@ -1491,9 +1482,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
             prompt_req_ids.append(req_id)
             prompt_scheduled_tokens.append(num_scheduled_tokens)
-            logger.debug(
-                f"Traverse prompts: add req_id {req_id} to prompt_req_ids, append {num_scheduled_tokens} to prompt_scheduled_tokens"
-            )
 
         return PromptDecodeInfo(prompt_req_ids, decode_req_ids, prompt_scheduled_tokens)
 
@@ -2910,7 +2898,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 # Return empty ModelRunnerOuptut if there's no work to do.
                 return EMPTY_MODEL_RUNNER_OUTPUT
             # For D case, wait until kv finish load here
-            logger.debug("kv_connector_no_forward")
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
         if self.input_batch.pooling_params:
             (input_ids, position_ids, num_scheduled_tokens, attn_metadata,
@@ -2937,7 +2924,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         num_decodes = len(pd_info.decode_req_ids)
         num_prefills = len(pd_info.prompt_req_ids)
         num_reqs = num_decodes + num_prefills
-        logger.debug(f"num_prefills {num_prefills}, num_decodes {num_decodes}")
         with self.profiler.record_event('internal', 'prepare_input_tensors'):
             prefill_input_data, decode_input_data = self._prepare_inputs(scheduler_output, num_prefills, num_decodes,
                                                                          warmup_mode)
@@ -4142,7 +4128,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         else:
             prompt_cfg = None
             decode_cfg = 1, 1, 1
-        logger.debug(f"dummy run with prompt_cfg {prompt_cfg} decode_cfg {decode_cfg}")
         self._prepare_dummy_scenario(prompt_cfg, decode_cfg)
         return
 
