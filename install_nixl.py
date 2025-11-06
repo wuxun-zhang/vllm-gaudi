@@ -12,7 +12,8 @@ UCX_DIR = os.path.join('/tmp', 'ucx_source')
 NIXL_DIR = os.path.join('/tmp', 'nixl_source')
 UCX_INSTALL_DIR = os.path.join('/tmp', 'ucx_install')
 UCX_REPO_URL = 'https://github.com/openucx/ucx.git'
-NIXL_REPO_URL = 'https://github.com/ai-dynamo/nixl.git'
+# NIXL_REPO_URL = 'https://github.com/ai-dynamo/nixl.git'
+NIXL_REPO_URL = 'https://github.com/intel-staging/nixl.git'
 
 
 # --- Helper Functions ---
@@ -124,7 +125,7 @@ def build_and_install_prerequisites(args):
     # -- Step 2: Build NIXL wheel from source --
     print("\n[2/3] Building NIXL wheel from source...", flush=True)
     if not os.path.exists(NIXL_DIR):
-        run_command(['git', 'clone', NIXL_REPO_URL, NIXL_DIR])
+        run_command(['git', 'clone', '-b', 'v0.6.0_OFI', NIXL_REPO_URL, NIXL_DIR])
 
     build_env = os.environ.copy()
     build_env['PKG_CONFIG_PATH'] = os.path.join(ucx_install_path, 'lib', 'pkgconfig')
