@@ -18,7 +18,7 @@ class LinearBucketingStrategy:
         prompt_bs_bucket_cfg = read_bucket_settings('prompt', 'bs', min=1, step=1, max=max_num_prefill_seqs)
         prompt_query_bucket_cfg = read_bucket_settings('prompt',
                                                        'query',
-                                                       min=block_size,
+                                                       min=1,
                                                        step=block_size,
                                                        max=max_num_batched_tokens)
         max_ctx = math.ceil((max_model_len - prompt_query_bucket_cfg[0]) // block_size)

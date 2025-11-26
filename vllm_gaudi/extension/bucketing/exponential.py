@@ -36,7 +36,7 @@ class ExponentialBucketingStrategy():
         prompt_bs_limit = math.ceil(math.log2(max_num_prefill_seqs)) + 1
         prompt_bs_bucket_cfg = [1, 2, max_num_prefill_seqs, prompt_bs_limit]
         max_prompt_seq_limit = math.ceil(math.log2(max_num_batched_tokens))
-        prompt_query_bucket_cfg = [block_size, block_size, max_num_batched_tokens, max_prompt_seq_limit]
+        prompt_query_bucket_cfg = [1, block_size, max_num_batched_tokens, max_prompt_seq_limit]
         max_ctx = max(1, math.ceil((max_model_len - prompt_query_bucket_cfg[0]) // block_size))
         max_prompt_ctx_limit = 2 if max_ctx == 1 else math.ceil(math.log2(max_ctx)) + 1
         prompt_ctx_bucket_cfg = [0, 1, max_ctx, max_prompt_ctx_limit]
@@ -125,7 +125,8 @@ def warmup_range_with_limit(config: Tuple[int, int, int, int], long_context=Fals
 
     bmin, bstep, bmax, num_buckets = config
     add_zero_bucket = bmin == 0
-    if add_zero_bucket:
+    add_one_bucket = bmin == 1
+    if add_zero_bucket or add_one_bucket:
         bmin = bstep
     linear_buckets = set(np.arange(bmin, bmax + 1, step=bstep))
     assert num_buckets > 0, "num_buckets must be a positive integer"
@@ -176,4 +177,6 @@ def warmup_range_with_limit(config: Tuple[int, int, int, int], long_context=Fals
                 buckets.add(bucket)
     if add_zero_bucket:
         buckets.add(0)
+    if add_one_bucket:
+        buckets.add(1)
     return list(sorted(buckets))
