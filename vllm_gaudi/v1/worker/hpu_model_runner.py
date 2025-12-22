@@ -2194,7 +2194,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         # NOTE(Chendi): Follow GPU_Model_Runner to use global
         # self.positions_cpu, which updated in prepare_inputs from
         # self.input_batch.num_computed_tokens_cpu[req_indices]
-        positions = torch.zeros((padded_batch_size, num_tokens), num_batched_reqs, dtype=torch.int32)
+        positions = torch.zeros((padded_batch_size, num_tokens), dtype=torch.int32)
         if num_tokens == 1:
             positions[:num_batched_reqs] = self.positions_cpu[:num_batched_reqs].view(-1, 1)
         else:
@@ -2391,6 +2391,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.is_kv_consumer:
             num_batched_reqs += num_prefills
 
+        if self.debug_fwd:
+            print(f"Wuxun debug>> num_decodes: {num_decodes}, num_prefills: {num_prefills}, num_batched_reqs: {num_batched_reqs}")
+
         num_pad_across_dp = self.get_dp_padding(num_batched_reqs)
         if num_batched_reqs == 0:
             if num_pad_across_dp > 0:
@@ -2401,8 +2404,8 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         # when PD turned on, there could be also prefix-prefill reqs with num
         # scheduled tokens = 1, here we batch such reqs along with decode reqs.
         if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.is_kv_consumer:
-            return self._create_decode_input_data_prefix_prefill(num_decodes, num_prefills, num_scheduled_tokens,
-                                                                 self.input_batch.num_computed_tokens_cpu,
+            return self._create_decode_input_data_prefix_prefill(num_batched_reqs, num_scheduled_tokens,
+                                                                 self.input_batch.num_computed_tokens_cpu[:num_batched_reqs],
                                                                  self.input_batch.block_table[0].get_cpu_tensor(),
                                                                  scheduler_output), None
 
@@ -3499,8 +3502,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             e4 = ht.hpu.Event(enable_timing=True)
             e5 = ht.hpu.Event(enable_timing=True)
             e6 = ht.hpu.Event(enable_timing=True)
-            e7 = ht.hpu.Event(enable_timing=True)
-            e8 = ht.hpu.Event(enable_timing=True)
             e0.record()
         if self.unified_attn:
             return self.unified_execute_model(scheduler_output, warmup_mode)
@@ -3693,9 +3694,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                         invalid_req_indices.append(prefill_start_idx + idx)
                 htorch.core.mark_step()
 
-                if self.debug_fwd:
-                    e7.record()
-
                 non_flattened_hidden_states, aux_hidden_states, \
                     sample_hidden_states, logits_device = \
                     self._execute_model_generic(
@@ -3708,9 +3706,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                         warmup_mode=warmup_mode,)
 
                 htorch.core.mark_step()
-
-                if self.debug_fwd:
-                    e8.record()
 
                 non_flattened_hidden_states_prefills.append(non_flattened_hidden_states)
                 if self.use_aux_hidden_state_outputs:
@@ -4022,7 +4017,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 f"prefill_req_ids {pd_info.prompt_req_ids}, "
                 f"num_decodes {num_decodes}, "
                 f"decode_req_ids {pd_info.decode_req_ids}, "
-                f"prefill sampling {e7.elapsed_time(e8) if num_prefills > 0 else None}, "
                 f"num_pad_prefill_batch_across_dp {num_pad_prefill_batch_across_dp}, "
                 f"dummy_decode_input_data_across_dp {True if dummy_decode_input_data_across_dp is not None else None}, "
                 f"prepare_data {e0.elapsed_time(e1)}, "
