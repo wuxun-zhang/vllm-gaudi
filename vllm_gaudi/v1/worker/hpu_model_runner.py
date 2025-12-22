@@ -1818,19 +1818,27 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         logits_indices = pad_list(logits_indices, round_up(len(logits_indices), self.logits_rounding),
                                   itertools.repeat(-1))
 
-        if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.is_kv_consumer:
-            # cuurently all tensor are on host side
-            context_blocks_t = torch.tensor(context_blocks, dtype=torch.int32, device='cpu')
-            query_lens = torch.tensor(query_lens, dtype=torch.int32, device='cpu')
-        else:
-            query_lens = async_h2d_copy(query_lens, dtype=torch.int32)
-            token_ids = async_h2d_copy(token_ids, dtype=torch.int32)
-            token_positions = async_h2d_copy(token_positions, dtype=torch.int32)
-            token_slots = async_h2d_copy(token_slots, dtype=torch.int64)
-            logits_indices = async_h2d_copy(logits_indices, dtype=torch.int32)
-            context_lens = async_h2d_copy(context_lens, dtype=torch.int32)
-            context_blocks_t: Optional[torch.tensor]
-            context_blocks_t = async_h2d_copy(context_blocks, dtype=torch.int32).flatten() if has_context else None
+        # if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.is_kv_consumer:
+        #     # cuurently all tensor are on host side
+        #     context_blocks_t = torch.tensor(context_blocks, dtype=torch.int32, device='cpu')
+        #     query_lens = torch.tensor(query_lens, dtype=torch.int32, device='cpu')
+        # else:
+        #     query_lens = async_h2d_copy(query_lens, dtype=torch.int32)
+        #     token_ids = async_h2d_copy(token_ids, dtype=torch.int32)
+        #     token_positions = async_h2d_copy(token_positions, dtype=torch.int32)
+        #     token_slots = async_h2d_copy(token_slots, dtype=torch.int64)
+        #     logits_indices = async_h2d_copy(logits_indices, dtype=torch.int32)
+        #     context_lens = async_h2d_copy(context_lens, dtype=torch.int32)
+        #     context_blocks_t: Optional[torch.tensor]
+        #     context_blocks_t = async_h2d_copy(context_blocks, dtype=torch.int32).flatten() if has_context else None
+        query_lens = async_h2d_copy(query_lens, dtype=torch.int32)
+        token_ids = async_h2d_copy(token_ids, dtype=torch.int32)
+        token_positions = async_h2d_copy(token_positions, dtype=torch.int32)
+        token_slots = async_h2d_copy(token_slots, dtype=torch.int64)
+        logits_indices = async_h2d_copy(logits_indices, dtype=torch.int32)
+        context_lens = async_h2d_copy(context_lens, dtype=torch.int32)
+        context_blocks_t: Optional[torch.tensor]
+        context_blocks_t = async_h2d_copy(context_blocks, dtype=torch.int32).flatten() if has_context else None
 
         attn_metadata = HPUAttentionMetadataV1.make_prefill_metadata(seq_lens_tensor=query_lens,
                                                                      context_lens_tensor=context_lens,
