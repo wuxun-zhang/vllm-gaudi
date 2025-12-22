@@ -1903,8 +1903,14 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         outputs = [self._form_prefill_batch(new_batch_contents.clone()) for _ in range(num_prefills)]
         return outputs
 
-    def _prepare_prefill_inputs(self, num_prefills, num_decodes,
-                                num_scheduled_tokens: list[int]) -> tuple[PrefillInputData, Optional[PrefillInputData]]:
+    def _prepare_prefill_inputs(
+            self, num_prefills, num_decodes,
+            num_scheduled_tokens: list[int]) -> tuple[Optional[PrefillInputData], Optional[PrefillInputData]]:
+
+        # those prefix-prefill reqs has been batched with decode reqs
+        if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.is_kv_consumer:
+            return None, None
+
         all_batch_contents, num_pad_across_dp = \
             self._extract_prefill_batch_contents(
                 num_prefills, num_decodes, num_scheduled_tokens)
@@ -2145,7 +2151,224 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                ),
                                spec_decode_metadata=spec_decode_metadata)
 
+    def _create_decode_input_data_prefix_prefill(self,
+                                                 num_batched_reqs,
+                                                 num_scheduled_tokens,
+                                                 context_lens,
+                                                 block_table_cpu_tensor,
+                                                 scheduler_output=None) -> DecodeInputData:
+        # NOTE(kzawora): the +1 is what causes this entire thing to work,
+        # as in the paged attention, we don't fetch just the context from cache,
+        # but also kvs for the current token
+        num_blocks = np.ceil((context_lens + 1) / self.block_size).astype(np.int32).tolist()
+
+        # PAD FOR STATIC SHAPES.
+        padded_batch_size: int
+        padded_batch_size = self.bucketing_manager.find_decode_bucket(num_batched_reqs, sum(num_blocks))[0]
+
+        # dp aware padding
+        padded_batch_size += self.get_dp_padding(padded_batch_size)
+
+        num_tokens_per_req = num_scheduled_tokens[:num_batched_reqs]
+        num_tokens = max(num_tokens_per_req)
+        total_num_scheduled_tokens = sum(num_tokens_per_req)
+        num_tokens_per_req = num_tokens_per_req + [0] * (padded_batch_size - num_batched_reqs)
+
+        block_tables_list = []
+        for i, n in enumerate(num_blocks):
+            seq_block_table = block_table_cpu_tensor[i, :n].tolist()
+            assert len(seq_block_table) == n
+            block_tables_list.extend([seq_block_table] * num_tokens)
+
+        ###################################
+        # initialize positions with padding
+        # POSITIONS. [batch, num_tokens]
+        # NOTE(Chendi): Follow GPU_Model_Runner to use global
+        # self.positions_cpu, which updated in prepare_inputs from
+        # self.input_batch.num_computed_tokens_cpu[req_indices]
+        positions = torch.zeros((padded_batch_size, num_tokens), num_batched_reqs, dtype=torch.int32)
+        if num_tokens == 1:
+            positions[:num_batched_reqs] = self.positions_cpu[:num_batched_reqs].view(-1, 1)
+        else:
+            # per request using universal self.positions_cpu then pad
+            position_split_tensors = torch.split(self.positions_cpu[:total_num_scheduled_tokens], num_tokens_per_req)
+            positions[:num_batched_reqs] = \
+                pad_sequence(list(position_split_tensors),
+                                batch_first=True,
+                                padding_value=0)[:num_batched_reqs]
+
+        padded_index = torch.zeros((padded_batch_size, num_tokens), dtype=torch.int64)
+        index = positions.to(torch.int64)[:num_batched_reqs]
+        padded_index[:num_batched_reqs] = index
+        input_mrope_positions_list: list[list[int]] = [[] for _ in range(3)]
+        if self.uses_mrope:
+            for idx, req_id in enumerate(self.input_batch.req_ids[:num_batched_reqs]):
+                seq_data = self.requests[req_id]
+                context_len = context_lens[idx]
+                position = context_len
+                if seq_data.mrope_position_delta is not None:
+                    seq_data.mrope_position_delta = int(seq_data.mrope_position_delta)
+                    pos_for_mrope = MRotaryEmbedding \
+                        .get_next_input_positions(
+                            seq_data.mrope_position_delta,
+                            context_len=context_len,
+                            seq_len=context_len + 1)
+                else:
+                    pos_for_mrope = [[position]] * 3
+                for idx in range(3):
+                    input_mrope_positions_list[idx].extend(pos_for_mrope[idx])
+
+            positions = torch.tensor(input_mrope_positions_list, dtype=torch.int32, device='cpu')
+
+            # Pad the right side of input_mrope_positions by padded_batch_size
+            pad_size = padded_batch_size - positions.size(1)
+            if pad_size > 0:
+                positions = F.pad(positions, (0, pad_size), value=-1, mode='constant')
+
+        ###################################
+        # initialize token_ids with padding
+        # TOKEN_IDS. [batch, num_tokens]
+        # NOTE(Chendi): Follow GPU_Model_Runner to use global
+        # self.input_ids_cpu, which updated in prepare_inputs from
+        # self.input_batch.token_ids_cpu[:total_num_scheduled_tokens]
+        token_ids = torch.zeros((padded_batch_size, num_tokens), dtype=torch.int32)
+        if num_tokens == 1:
+            token_ids[:num_batched_reqs] = self.input_ids_cpu[:num_batched_reqs].view(-1, 1)
+        else:
+            token_ids_split_tensors = torch.split(self.input_ids_cpu[:total_num_scheduled_tokens], num_tokens_per_req)
+            token_ids[:num_batched_reqs] = \
+                pad_sequence(list(token_ids_split_tensors),
+                                batch_first=True,
+                                padding_value=0)[:num_batched_reqs]
+
+        ###################################
+        # SLOT_MAPPING [batch, 1]
+        # The "slot" is the "physical index" of a token in the KV cache.
+        # Look up the block_idx in the block table (logical<>physical map)
+        # to compute this.
+        block_number = torch.ones((padded_batch_size, num_tokens), dtype=torch.int32) * self._PAD_BLOCK_ID
+        block_number[:num_batched_reqs] = torch.gather(input=block_table_cpu_tensor,
+                                                       dim=1,
+                                                       index=(index // self.block_size))
+        block_number.apply_(self.defragmenter.resolve)
+
+        block_offsets = padded_index % self.block_size
+        slot_mapping = block_number * self.block_size + block_offsets
+        # set an out of range value for the padding tokens so that they
+        # are ignored when inserting into the KV cache.
+        slot_mapping = slot_mapping[:padded_batch_size]
+        dummy_slots = itertools.cycle(range(self._PAD_SLOT_ID, self._PAD_SLOT_ID + self.block_size))
+        slot_mapping[num_batched_reqs:].apply_(lambda _, ds=dummy_slots: next(ds))
+
+        #####################################
+        # NOTE(Chendi): Since we can't actually do num_tokens = 2,
+        # convert to [batch_size * num_tokens, 1]
+        if num_tokens > 1:
+            token_ids = token_ids.view(-1, 1)
+            positions = padded_index.view(-1, 1)
+            slot_mapping = slot_mapping.view(-1, 1)
+
+        logits_indices = torch.zeros(padded_batch_size, dtype=torch.int32, device='cpu')
+
+        # NOTE(Chendi): num_tokens might be > 1 in spec decode case,
+        # example:
+        # num_scheduled_tokens = [2, 1, 2, 1]
+        # padded tokens_id = \
+        #     [[tok_0, tok_1], [tok_2, pad], [tok_4, tok_4], [tok_6, pad]]
+        # num_tokens = 2
+        # query_start_loc_list = [2, 3, 6, 7]
+        # query_start_loc_cpu = [0, 2, 3, 6, 7]
+        # logits_indices = [1, 2, 5, 6] => the last token of each request
+        query_start_loc_list = [i * num_tokens + n for i, n in enumerate(num_scheduled_tokens[:num_batched_reqs])]
+        query_start_loc_cpu = torch.empty((padded_batch_size + 1, ),
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+        query_start_loc_np = query_start_loc_cpu.numpy()
+        query_start_loc_np[0] = 0
+        query_start_loc_np[1:num_batched_reqs + 1] = np.array(query_start_loc_list)
+
+        logits_indices[:num_batched_reqs] = query_start_loc_cpu[1:num_batched_reqs + 1] - 1
+
+        positions_device = async_h2d_copy(positions, device=self.device)
+        block_tables_list = self.defragmenter.resolve_all(block_tables_list)
+
+        # CONTEXT_LENS [batch_size]
+        block_list, block_groups, block_usage = \
+            self.get_habana_paged_attn_buffers(
+                block_tables_list,
+                slot_mapping.tolist(),
+                padded_batch_size * num_tokens
+            )
+
+        if self.interleaved_sliding_window and self.sliding_window > 0:
+            sliding_block_size = (self.sliding_window // self.block_size)
+            window_block_tables = [block_table[-sliding_block_size:] for block_table in block_tables_list]
+            window_block_list, window_block_groups, window_block_usage = \
+                self.get_habana_paged_attn_buffers(
+                    window_block_tables, slot_mapping.tolist(),
+                    padded_batch_size * num_tokens)
+
+        # CPU<>HPU sync *should not* happen here.
+        block_list_device = async_h2d_copy(block_list, device=self.device)
+        block_usage_device = async_h2d_copy(block_usage, device=self.device)
+        block_groups_device = async_h2d_copy(block_groups, device=self.device)
+        slot_mapping_device = async_h2d_copy(slot_mapping, device=self.device)
+        window_block_list_device = async_h2d_copy(window_block_list,
+                                                  device=self.device) if self.interleaved_sliding_window else None
+        window_block_usage_device = async_h2d_copy(window_block_usage,
+                                                   device=self.device) if self.interleaved_sliding_window else None
+        window_block_groups_device = async_h2d_copy(window_block_groups,
+                                                    device=self.device) if self.interleaved_sliding_window else None
+
+        token_ids_device = async_h2d_copy(token_ids, device=self.device)
+        # when DP also enabled, some DP ranks will exeucte dummy run with empty
+        # SchedulerOutput, in this case we need skip the prepare_input_ids
+        if self.use_async_scheduling and scheduler_output is not None:
+            self._prepare_input_ids(scheduler_output)
+            if num_tokens == 1:
+                token_ids_device[:num_batched_reqs] = self.input_ids_hpu[:num_batched_reqs].view(-1, 1)
+            else:
+                token_ids_split_tensors = torch.split(self.input_ids_hpu[:total_num_scheduled_tokens],
+                                                      num_tokens_per_req)
+                token_ids_device[:num_batched_reqs] = \
+                    pad_sequence(list(token_ids_split_tensors),
+                                    batch_first=True,
+                                    padding_value=0)[:num_batched_reqs]
+
+            #####################################
+            # NOTE(Chendi): Since we can't actually do num_tokens = 2,
+            # convert to [batch_size * num_tokens, 1]
+            if num_tokens > 1:
+                token_ids_device = token_ids_device.view(-1, 1)
+
+        # call prepare_spec_decode_inputs to get the logits indices and
+        if scheduler_output is not None:
+            logits_indices, spec_decode_metadata = self._prepare_spec_decode_inputs(scheduler_output, logits_indices,
+                                                                                    token_ids_device, num_tokens)
+        else:
+            spec_decode_metadata = None
+        logits_indices_device = async_h2d_copy(logits_indices, device=self.device)
+
+        return DecodeInputData(num_decodes=num_batched_reqs,
+                               token_ids=token_ids_device,
+                               position_ids=positions_device,
+                               logits_indices=logits_indices_device,
+                               attn_metadata=HPUAttentionMetadataV1.make_decode_metadata(
+                                   block_list=block_list_device,
+                                   block_usage=block_usage_device,
+                                   block_groups=block_groups_device,
+                                   input_positions=None,
+                                   slot_mapping=slot_mapping_device,
+                                   block_size=self.block_size,
+                                   window_block_list=window_block_list_device,
+                                   window_block_usage=window_block_usage_device,
+                                   window_block_groups=window_block_groups_device,
+                               ),
+                               spec_decode_metadata=spec_decode_metadata)
+
     def _prepare_decode_inputs(self,
+                               num_prefills,
                                num_decodes,
                                num_scheduled_tokens,
                                scheduler_output=None) -> tuple[DecodeInputData, Optional[DecodeInputData]]:
@@ -2156,12 +2379,25 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         # logic knows to ignore those indicies. Otherwise, the
         # padding data can be dummy since we have a causal mask.
 
-        num_pad_across_dp = self.get_dp_padding(num_decodes)
-        if num_decodes == 0:
+        num_batched_reqs = num_decodes
+        if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.is_kv_consumer:
+            num_batched_reqs += num_prefills
+
+        num_pad_across_dp = self.get_dp_padding(num_batched_reqs)
+        if num_batched_reqs == 0:
             if num_pad_across_dp > 0:
                 dummy_decode_input_data = self._create_dummy_decode_input_data()
                 return DecodeInputData(num_decodes=0), dummy_decode_input_data
             return DecodeInputData(num_decodes=0), None
+
+        # when PD turned on, there could be also prefix-prefill reqs with num
+        # scheduled tokens = 1, here we batch such reqs along with decode reqs.
+        if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.is_kv_consumer:
+            return self._create_decode_input_data_prefix_prefill(num_decodes, num_prefills, num_scheduled_tokens,
+                                                                 self.input_batch.num_computed_tokens_cpu,
+                                                                 self.input_batch.block_table[0].get_cpu_tensor(),
+                                                                 scheduler_output), None
+
         return self._create_decode_input_data(num_decodes, num_scheduled_tokens,
                                               self.input_batch.num_computed_tokens_cpu[:num_decodes],
                                               self.input_batch.block_table[0].get_cpu_tensor(), scheduler_output), None
@@ -2401,7 +2637,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             num_scheduled_tokens.append(seq_num_scheduled_tokens)
             num_prompt_tokens.append(seq_num_prompt_tokens)
         return (self._prepare_prefill_inputs(num_prefills, num_decodes, num_scheduled_tokens),
-                self._prepare_decode_inputs(num_decodes, num_scheduled_tokens, scheduler_output))
+                self._prepare_decode_inputs(num_prefills, num_decodes, num_scheduled_tokens, scheduler_output))
 
     def _seq_len(self, attn_metadata):
         return attn_metadata.seq_len()
@@ -3391,18 +3627,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         if self.debug_fwd:
             e1.record()
         ######################### PREFILLS #########################
-        if num_prefills > 0:
-
-            converted_decode_input_data = []
-            converted_req_ids = []
-
-            if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.is_kv_consumer:
-                assert num_prefills == len(list(zip(*shallow_tuple(prefill_data))))
-                converted_decode_input_data = self.convert_prefill_metadata_to_decode(num_decodes, num_prefills)
-                converted_req_ids = self.input_batch.req_ids[num_decodes:num_decodes + num_prefills]
-                # for i in range(len(list(zip(*shallow_tuple(prefill_data))))):
-                # converted_decode_input_data.append(self.convert_prefill_metadata_to_decode(num_decodes + i))
-                # converted_req_ids.append(self.input_batch.req_ids[num_decodes + i])
+        if num_prefills > 0 and prefill_data is not None:
 
             htorch.core.mark_step()
             for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices,
@@ -3444,8 +3669,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 # If logits_indices is smaller than req_id, the last request is a chunked prompt request that
                 # hasn't finished in this step. We add the last token position to logits_indices to ensure
                 # the last token of the chunk is sampled. This sampled token will be discarded later
-                if (not has_kv_transfer_group() or not self.vllm_config.kv_transfer_config.is_kv_consumer
-                    ) and logits_indices.shape[0] < len(req_id):
+                if logits_indices.shape[0] < len(req_id):
                     if structured_output or self.use_async_scheduling:
                         # When there are multiple requests in the batch (e.g. self.use_merged_prefill=True),
                         # the last token position is the sum of all prompt lengths - 1
@@ -3463,49 +3687,17 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
                 if self.debug_fwd:
                     e7.record()
-                # for first prefill run on decode node, we will convert to
-                # decode forward run to reduce num tokens participating in allgather
-                if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.is_kv_consumer:
-                    # if self.debug_fwd:
-                    #     print(f"Wuxun debug>> converting prefill forward to decode forward for req id {req_id}")
-                    # new_decode_data = self.convert_prefill_metadata_to_decode(num_decodes)
-                    new_decode_data = converted_decode_input_data
-                    # assume only one req in a batch
-                    if req_id[0] != converted_req_ids[idx]:
-                        print(
-                            f"Wuxun debug>> req id mismatch: original {req_id}, converted {converted_req_ids[idx]}, all converted reqs {converted_req_ids}"
-                        )
-                        assert req_id == converted_req_ids[idx]
 
-                    if self.debug_fwd:
-                        print(
-                            f"Wuxun debug>> num real prefills {num_prefills} converted decoding, bs {new_decode_data.token_ids.size(0)}, seqlen {new_decode_data.token_ids.size(1)}, token_ids {new_decode_data.token_ids}, \nposition_ids {new_decode_data.position_ids}, \nblock_list {new_decode_data.attn_metadata.block_list}, context_len {new_decode_data.attn_metadata.context_lens_tensor}, logits_indices {new_decode_data.logits_indices}, slot_mapping {new_decode_data.attn_metadata.slot_mapping}"
-                        )
-
-
-                    non_flattened_hidden_states, aux_hidden_states, \
-                        sample_hidden_states, logits_device = \
-                        self._execute_model_generic(
-                            new_decode_data.token_ids,
-                            new_decode_data.position_ids,
-                            new_decode_data.attn_metadata,
-                            new_decode_data.logits_indices,
-                            self.kv_caches,
-                            lora_logits_mask,
-                            lora_mask,
-                            warmup_mode=warmup_mode,)
-
-                else:
-                    non_flattened_hidden_states, aux_hidden_states, \
-                        sample_hidden_states, logits_device = \
-                        self._execute_model_generic(
-                            token_ids, position_ids, attn_metadata, logits_indices,
-                            self.kv_caches,
-                            lora_logits_mask,
-                            lora_mask,
-                            inputs_embeds=inputs_embeds,
-                            model_mm_kwargs=model_mm_kwargs,
-                            warmup_mode=warmup_mode,)
+                non_flattened_hidden_states, aux_hidden_states, \
+                    sample_hidden_states, logits_device = \
+                    self._execute_model_generic(
+                        token_ids, position_ids, attn_metadata, logits_indices,
+                        self.kv_caches,
+                        lora_logits_mask,
+                        lora_mask,
+                        inputs_embeds=inputs_embeds,
+                        model_mm_kwargs=model_mm_kwargs,
+                        warmup_mode=warmup_mode,)
 
                 htorch.core.mark_step()
 
@@ -3544,9 +3736,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                                                              is_prompt=True)
                     self.profiler.record_counter(self.event_start, counters)
 
-                # only need decode forward once
-                break
-
             if not warmup_mode:
                 self.maybe_wait_for_kv_save()
 
@@ -3559,76 +3748,30 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 f"Wuxun debug>> num real prefills {num_prefills}, num pad prefill batch across dp {num_pad_prefill_batch_across_dp}"
             )
 
-        # only run dummy prefill when there is no real req
-        if num_prefills < 1 and num_pad_prefill_batch_across_dp > 0:
-
-            converted_dummy_decode_input_data = None
-            if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.is_kv_consumer:
-                for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata,
-                          logits_indices, logits_requests) in enumerate(
-                              zip(*shallow_tuple(dummy_prefill_input_data_batches_across_dp))):
-                    # converted_dummy_decode_input_data.append(self.create_decode_from_dummy_prefill(attn_metadata, num_pad_prefill_batch_across_dp))
-                    converted_dummy_decode_input_data = self.create_decode_from_dummy_prefill(
-                        attn_metadata, num_pad_prefill_batch_across_dp)
-                    break
-
+        if num_pad_prefill_batch_across_dp > 0:
             htorch.core.mark_step()
 
             for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices,
                       logits_requests) in enumerate(zip(*shallow_tuple(dummy_prefill_input_data_batches_across_dp))):
                 htorch.core.mark_step()
 
-                # if self.debug_fwd:
-                #     # token_ids [bs, seq_len], position_ids [bs, seq_len]
-                #     # block_list [bs, num_blocks], context_lens_tensor [bs]
-                #     # logits_indices [num_logits]
-                #     print(
-                #         f"Wuxun debug>> Dummy before convert, req id {req_id}, prompt_len {prompt_len}, token_ids {token_ids}, \nposition_ids {position_ids}, \nblock_list {attn_metadata.block_list}, context_len {attn_metadata.context_lens_tensor}, logits_indices {logits_indices}, slot_mapping {attn_metadata.slot_mapping}"
-                #     )
-
-                if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.is_kv_consumer:
-                    # new_decode_data = self.create_decode_from_dummy_prefill(attn_metadata)
-                    new_decode_data = converted_dummy_decode_input_data
-
-                    # if self.debug_fwd:
-                    #     print(
-                    #         f"Wuxun debug>> Dummy converted decoding, token_ids {new_decode_data.token_ids}, \nposition_ids {new_decode_data.position_ids}, \nblock_list {new_decode_data.attn_metadata.block_list}, context_len {new_decode_data.attn_metadata.context_lens_tensor}, logits_indices {new_decode_data.logits_indices}, slot_mapping {new_decode_data.attn_metadata.slot_mapping}"
-                    #     )
-
-                    if self.debug_fwd:
-                        print(
-                            f"WUxun debug>> dummy prefill converted decode, bs {new_decode_data.token_ids.size(0)}, seqlen {new_decode_data.token_ids.size(1)}"
-                        )
-
-                    _, _, _, dummy_logits_device = \
-                    self._execute_model_generic(
-                        new_decode_data.token_ids,
-                        new_decode_data.position_ids,
-                        new_decode_data.attn_metadata,
-                        new_decode_data.logits_indices,
-                        self.kv_caches,
-                        None,
-                        None,
-                        warmup_mode=warmup_mode)
-                else:
-                    _, _, _, dummy_logits_device = \
-                    self._execute_model_generic(
-                        token_ids,
-                        position_ids,
-                        attn_metadata,
-                        logits_indices,
-                        self.kv_caches,
-                        None,
-                        None,
-                        warmup_mode=warmup_mode)
-                htorch.core.mark_step()
-
-                # only need decode forward once
-                break
+                _, _, _, dummy_logits_device = \
+                self._execute_model_generic(
+                    token_ids,
+                    position_ids,
+                    attn_metadata,
+                    logits_indices,
+                    self.kv_caches,
+                    None,
+                    None,
+                    warmup_mode=warmup_mode)
+            htorch.core.mark_step()
 
         if self.debug_fwd:
             e3.record()
         ######################### DECODES #########################
+        if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.is_kv_consumer:
+            num_decodes += num_prefills
         # Decodes run as one single batch with [padded_decode_bs, 1]
         if num_decodes > 0:
             assert decode_data is not None
